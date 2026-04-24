@@ -1,0 +1,156 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-app
+  namespace: aiops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiops-app
+  template:
+    metadata:
+      labels:
+        app: aiops-app
+    spec:
+      containers:
+        - name: app
+          image: python:3.11-slim
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.aiops.svc.cluster.local:4317
+          ports:
+            - containerPort: 8080
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              pip install --no-cache-dir flask opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc &&
+              python -u - <<'PY'
+              import json,random,time
+              from flask import Flask,request,jsonify,Response
+              from opentelemetry import trace,metrics,_logs
+              from opentelemetry.sdk.resources import Resource
+              from opentelemetry.sdk.trace import TracerProvider
+              from opentelemetry.sdk.trace.export import BatchSpanProcessor
+              from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+              from opentelemetry.sdk.metrics import MeterProvider
+              from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+              from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+              from opentelemetry.sdk._logs import LoggerProvider,LoggingHandler
+              from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+              from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+              resource=Resource.create({"service.name":"aiops-app"})
+              tp=TracerProvider(resource=resource)
+              tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint="otel-collector.aiops.svc.cluster.local:4317",insecure=True)))
+              trace.set_tracer_provider(tp)
+              tracer=trace.get_tracer("sim")
+              reader=PeriodicExportingMetricReader(OTLPMetricExporter(endpoint="otel-collector.aiops.svc.cluster.local:4317",insecure=True))
+              mp=MeterProvider(resource=resource,metric_readers=[reader])
+              metrics.set_meter_provider(mp)
+              meter=metrics.get_meter("sim")
+              req=meter.create_counter("requests_total")
+              err=meter.create_counter("request_errors_total")
+              lat=meter.create_histogram("request_latency_ms")
+              lp=LoggerProvider(resource=resource)
+              lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter(endpoint="otel-collector.aiops.svc.cluster.local:4317",insecure=True)))
+              _logs.set_logger_provider(lp)
+              h=LoggingHandler(level=20,logger_provider=lp)
+              import logging
+              log=logging.getLogger("sim")
+              log.setLevel(20)
+              log.addHandler(h)
+              app=Flask(__name__)
+              @app.get("/")
+              def home():
+                return Response("""<!doctype html>
+                <html>
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="viewport" content="width=device-width,initial-scale=1">
+                  <title>AIOps Live App</title>
+                  <style>
+                    body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:24px}
+                    .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+                    button{padding:10px 14px;border:0;border-radius:8px;cursor:pointer}
+                    #ok{background:#2e7d32;color:#fff}#high{background:#ef6c00;color:#fff}#err{background:#c62828;color:#fff}
+                    #loop{background:#1565c0;color:#fff}#stop{background:#616161;color:#fff}
+                    #out{white-space:pre-wrap;background:#000;padding:12px;border-radius:8px;min-height:220px}
+                    input{padding:8px;border-radius:6px;border:1px solid #444;background:#222;color:#fff;width:120px}
+                  </style>
+                </head>
+                <body>
+                  <h2>AIOps Live App</h2>
+                  <p>Use buttons to generate traffic and watch live responses.</p>
+                  <div class="row">
+                    <button id="ok" onclick="send(1,false)">Send Normal</button>
+                    <button id="high" onclick="send(5,false)">Send High Load</button>
+                    <button id="err" onclick="send(5,true)">Send Error</button>
+                  </div>
+                  <div class="row">
+                    <label>RPS <input id="rps" value="5"></label>
+                    <label>Seconds <input id="sec" value="20"></label>
+                    <button id="loop" onclick="startLoad()">Start Load</button>
+                    <button id="stop" onclick="stopLoad()">Stop</button>
+                  </div>
+                  <div id="out"></div>
+                <script>
+                  let timer=null;
+                  const out=document.getElementById('out');
+                  function log(m){out.textContent=`${new Date().toLocaleTimeString()} ${m}\\n`+out.textContent;}
+                  async function send(load,force_error){
+                    try{
+                      const r=await fetch('/api/infer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({load,force_error})});
+                      const j=await r.json();
+                      log(`${r.status} load=${load} error=${force_error} latency=${j.latency_ms}`);
+                    }catch(e){log(`request_failed ${e}`);}
+                  }
+                  function startLoad(){
+                    stopLoad();
+                    const rps=Math.max(1,parseInt(document.getElementById('rps').value||'1',10));
+                    const sec=Math.max(1,parseInt(document.getElementById('sec').value||'10',10));
+                    const every=Math.max(50,Math.floor(1000/rps));
+                    const end=Date.now()+sec*1000;
+                    timer=setInterval(()=>{if(Date.now()>end){stopLoad();return;}send(3,false);},every);
+                    log(`load_started rps=${rps} seconds=${sec}`);
+                  }
+                  function stopLoad(){if(timer){clearInterval(timer);timer=null;log('load_stopped');}}
+                </script>
+                </body>
+                </html>""",mimetype="text/html")
+              @app.get("/health")
+              def health():
+                return {"status":"ok"},200
+              @app.post("/api/infer")
+              def infer():
+                body=request.get_json(silent=True) or {}
+                load=float(body.get("load",1))
+                force_error=bool(body.get("force_error",False))
+                base=max(10,random.gauss(90,12))
+                latency=max(10,base+(load*80)+random.uniform(0,35))
+                is_error=1 if force_error or random.random()<(0.01+(0.02*load)) else 0
+                req.add(1)
+                if is_error: err.add(1)
+                lat.record(latency)
+                with tracer.start_as_current_span("inference-request") as span:
+                  span.set_attribute("latency_ms",latency)
+                  span.set_attribute("error",is_error)
+                  span.set_attribute("load",load)
+                log.info(json.dumps({"latency_ms":round(latency,2),"error":is_error,"load":load}))
+                if is_error:
+                  return jsonify({"ok":False,"latency_ms":round(latency,2)}),500
+                return jsonify({"ok":True,"latency_ms":round(latency,2)}),200
+              app.run(host="0.0.0.0",port=8080)
+              PY
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-app
+  namespace: aiops
+spec:
+  selector:
+    app: aiops-app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

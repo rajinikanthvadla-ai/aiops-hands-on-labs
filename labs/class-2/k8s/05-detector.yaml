@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anomaly-detector
+  namespace: aiops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anomaly-detector
+  template:
+    metadata:
+      labels:
+        app: anomaly-detector
+    spec:
+      containers:
+        - name: detector
+          image: python:3.11-slim
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              pip install --no-cache-dir requests numpy river &&
+              python -u - <<'PY'
+              import json,time,requests,numpy as np
+              from collections import deque
+              from river import anomaly
+              prom="http://prometheus.aiops.svc.cluster.local:9090/api/v1/query"
+              qlat="rate(request_latency_ms_sum[1m])/rate(request_latency_ms_count[1m])"
+              qerr="rate(request_errors_total[1m])/rate(requests_total[1m])"
+              lat_hist=deque(maxlen=30)
+              err_hist=deque(maxlen=30)
+              model=anomaly.HalfSpaceTrees(seed=42)
+              warm=0
+              def run_query(q):
+                r=requests.get(prom,params={"query":q},timeout=8).json()
+                rows=r.get("data",{}).get("result",[])
+                if not rows: return None
+                return float(rows[0]["value"][1])
+              while True:
+                try:
+                  lat=run_query(qlat)
+                  err=run_query(qerr)
+                  if lat is None or err is None:
+                    time.sleep(10)
+                    continue
+                  lat_hist.append(lat)
+                  err_hist.append(err)
+                  x={"latency":lat,"error_rate":err}
+                  score=model.score_one(x)
+                  model.learn_one(x)
+                  warm+=1
+                  z=0.0
+                  if len(lat_hist)>8:
+                    a=np.array(lat_hist)
+                    s=a.std()
+                    z=(lat-a.mean())/s if s>0 else 0.0
+                  m=0.0
+                  if len(lat_hist)>10:
+                    x2=np.array([lat,err])
+                    h=np.column_stack([np.array(lat_hist),np.array(err_hist)])
+                    mu=h.mean(axis=0)
+                    cov=np.cov(h.T)
+                    inv=np.linalg.pinv(cov)
+                    d=x2-mu
+                    m=float(np.sqrt(d.T@inv@d))
+                  hit=(abs(z)>3) or (m>3.2) or (warm>20 and score>0.92)
+                  out={"latency":round(lat,3),"error_rate":round(err,4),"zscore":round(z,3),"multivariate":round(m,3),"ml_score":round(score,3),"anomaly":hit}
+                  print(json.dumps(out),flush=True)
+                except Exception as e:
+                  print(json.dumps({"detector_error":str(e)}),flush=True)
+                time.sleep(10)
+              PY
