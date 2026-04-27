@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aiops-predict-every-2-min
+  namespace: aiops-class-3
+spec:
+  schedule: "*/2 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: predictor
+              image: python:3.11-slim
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  mkdir -p /workspace/app
+                  cp /scripts/* /workspace/app/
+                  cp /requirements/requirements.txt /workspace/app/requirements.txt
+                  pip install --no-cache-dir -r /workspace/app/requirements.txt
+                  python /workspace/app/predict.py
+              volumeMounts:
+                - name: aiops-storage
+                  mountPath: /workspace
+                - name: aiops-scripts
+                  mountPath: /scripts
+                - name: requirements
+                  mountPath: /requirements
+          volumes:
+            - name: aiops-storage
+              persistentVolumeClaim:
+                claimName: aiops-model-pvc
+            - name: aiops-scripts
+              configMap:
+                name: aiops-scripts
+            - name: requirements
+              configMap:
+                name: aiops-requirements
